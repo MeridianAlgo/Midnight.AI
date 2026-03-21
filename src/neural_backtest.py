@@ -3,6 +3,8 @@ import os
 # Add the project root to sys.path to allow running scripts directly from the root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.model import MidnightModel, prepare_features, get_feature_cols
+from src.memory_db import TradingMemoryDB
 import torch
 import pandas as pd
 import numpy as np
@@ -12,14 +14,11 @@ import os
 import warnings
 
 # Suppress library warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-from src.model import MidnightModel, prepare_features, get_feature_cols
-from src.memory_db import TradingMemoryDB
-from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 class MidnightBacktester:
     def __init__(self, symbol='BTC-USD', device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.symbol = symbol
@@ -244,7 +243,8 @@ class MidnightBacktester:
             # 7. Confidence Distribution
             ax7 = fig.add_subplot(gs[3, 3])
             all_probs = []
-            for k in action_probs: all_probs.extend(action_probs[k])
+            for k in action_probs:
+                all_probs.extend(action_probs[k])
             sns.kdeplot(all_probs, ax=ax7, shade=True, color='gold')
             ax7.set_title("Model Confidence Dist.")
 

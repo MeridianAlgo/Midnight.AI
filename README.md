@@ -1,4 +1,4 @@
-# Midnight.AI: AI Trading Engine for Bitcoin
+# Midnight.AI: AI Trading Engine for Bitcoin 1h
 
 Midnight.AI is a powerful automated trading system designed to find profitable opportunities in Bitcoin markets. It uses advanced math and artificial intelligence to "clean" market data and recognize patterns that humans might miss.
 

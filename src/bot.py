@@ -3,10 +3,11 @@ import os
 # Add the project root to sys.path to allow running scripts directly from the root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.model import MidnightModel, prepare_features, get_feature_cols
+from src.memory_db import TradingMemoryDB
 import os
 import torch
 import pandas as pd
-import numpy as np
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -18,13 +19,8 @@ from dotenv import load_dotenv
 import time
 import warnings
 
-# Suppress library warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
-
-from src.model import MidnightModel, prepare_features, get_feature_cols
-from src.memory_db import TradingMemoryDB
-
 load_dotenv()
 
 class MidnightLiveBot:

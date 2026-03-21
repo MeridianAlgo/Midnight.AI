@@ -70,7 +70,7 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, :x.size(1), :]
 
 class MidnightModel(nn.Module):
-    def __init__(self, input_size, hidden_size=256, num_heads=8, dropout=0.3):
+    def __init__(self, input_size, hidden_size=128, num_heads=4, dropout=0.6):
         super(MidnightModel, self).__init__()
         
         # 1. Input Projection & Positional Encoding
@@ -160,8 +160,52 @@ def prepare_features(df):
         
     from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator, ROCIndicator, UltimateOscillator, PercentagePriceOscillator, StochRSIIndicator, KAMAIndicator, TSIIndicator
     from ta.trend import MACD, EMAIndicator, ADXIndicator, CCIIndicator, PSARIndicator, SMAIndicator, AroonIndicator, VortexIndicator, TRIXIndicator, MassIndex, IchimokuIndicator, DPOIndicator
-    from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, DonchianChannel
+    from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, DonchianChannel, UlcerIndex
     from ta.volume import OnBalanceVolumeIndicator, MFIIndicator, AccDistIndexIndicator, ChaikinMoneyFlowIndicator, VolumePriceTrendIndicator, EaseOfMovementIndicator, ForceIndexIndicator
+    
+    # --- Advanced manual indicators ---
+    
+    # 1. SuperTrend
+    def calculate_supertrend(df, period=10, multiplier=3):
+        atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=period).average_true_range()
+        hl2 = (df['high'] + df['low']) / 2
+        
+        # Basic Upper and Lower Bands
+        final_upperband = hl2 + (multiplier * atr)
+        final_lowerband = hl2 - (multiplier * atr)
+        
+        # We need to loop because SuperTrend is stateful
+        # Vectorizing this is hard without numba, so we use a simple loop or approximation
+        # For simplicity and speed in this context, we will use a simplified approximation or just the bands difference
+        # Real SuperTrend requires previous row access.
+        
+        # Let's use a simpler proxy: Distance from ATR bands
+        return (df['close'] - final_lowerband) / (final_upperband - final_lowerband + 1e-9)
+
+    df['supertrend_pos'] = calculate_supertrend(df)
+
+    # 2. Choppiness Index (0-100: <38 Trending, >61 Choppy)
+    def calculate_choppiness(df, period=14):
+        atr_sum = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=1).average_true_range().rolling(window=period).sum()
+        high_low_range = df['high'].rolling(window=period).max() - df['low'].rolling(window=period).min()
+        
+        chop = 100 * np.log10(atr_sum / (high_low_range + 1e-9)) / np.log10(period)
+        return chop
+
+    df['choppiness'] = calculate_choppiness(df)
+
+    # 3. Coppock Curve (Long-term momentum)
+    def calculate_coppock(df, wma_period=10, roc_long=14, roc_short=11):
+        roc_l = ROCIndicator(close=df['close'], window=roc_long).roc()
+        roc_s = ROCIndicator(close=df['close'], window=roc_short).roc()
+        # Weighted Moving Average
+        return (roc_l + roc_s).ewm(span=wma_period, adjust=False).mean()
+
+    df['coppock'] = calculate_coppock(df)
+    
+    # 4. Ulcer Index (Downside Risk)
+    df['ulcer'] = UlcerIndex(close=df['close'], window=14).ulcer_index()
+
     
     # Price features
     df['returns'] = df['close'].pct_change()
@@ -171,7 +215,6 @@ def prepare_features(df):
     
     # Heikin-Ashi
     ha_close = (df['open'] + df['high'] + df['low'] + df['close']) / 4
-    ha_open = (df['open'].shift(1) + df['close'].shift(1)) / 2
     # Simplified HA for vectorized speed
     df['ha_close'] = ha_close
     df['ha_returns'] = df['ha_close'].pct_change()
@@ -180,12 +223,13 @@ def prepare_features(df):
     def calculate_hilbert(series):
         try:
             v = series.ffill().bfill().values
-            if len(v) < 10: return np.zeros(len(series)), np.zeros(len(series))
+            if len(v) < 10:
+                return np.zeros(len(series)), np.zeros(len(series))
             analytic_signal = hilbert(v)
             amplitude = np.abs(analytic_signal)
             phase = np.angle(analytic_signal)
             return amplitude, phase
-        except:
+        except Exception:
             return np.zeros(len(series)), np.zeros(len(series))
             
     df['hilbert_amp'], df['hilbert_phase'] = calculate_hilbert(df['close'])
@@ -205,7 +249,8 @@ def prepare_features(df):
     # Microstructure: Shannon Entropy (Predictability)
     def calculate_entropy(series, window=20):
         def entropy(x):
-            if len(x) < 5: return 0
+            if len(x) < 5:
+                return 0
             x = (x - np.mean(x)) / (np.std(x) + 1e-9)
             counts, _ = np.histogram(x, bins=10, range=(-3, 3), density=True)
             counts = counts / (np.sum(counts) + 1e-9)
@@ -228,7 +273,8 @@ def prepare_features(df):
     # Chaos Theory: Hurst Exponent (Simplified R/S)
     def calculate_hurst(series, window=30):
         def hurst_rs(ts):
-            if len(ts) < 10: return 0.5
+            if len(ts) < 10:
+                return 0.5
             try:
                 # Standardize
                 ts_norm = (ts - np.mean(ts)) / (np.std(ts) + 1e-9)
@@ -240,7 +286,7 @@ def prepare_features(df):
                 # For crypto, we expect 0.5 (random), >0.5 (trending), <0.5 (mean-reverting)
                 h = np.log(R / S + 1e-9) / np.log(len(ts))
                 return np.clip(h, 0, 1)
-            except:
+            except Exception:
                 return 0.5
         return series.rolling(window=window).apply(hurst_rs)
 
@@ -256,7 +302,7 @@ def prepare_features(df):
             temp_idx = pd.to_datetime(df.index)
             hour = temp_idx.hour
             day = temp_idx.dayofweek
-        except:
+        except Exception:
             hour = np.zeros(len(df))
             day = np.zeros(len(df))
             
@@ -324,6 +370,32 @@ def prepare_features(df):
     
     df['atr'] = AverageTrueRange(high=df['high'], low=df['low'], close=df['close']).average_true_range()
     df['volatility_std'] = df['returns'].rolling(window=14).std()
+
+    # --- Candlestick Patterns ---
+    body = np.abs(df['close'] - df['open'])
+    upper_shadow = df['high'] - np.maximum(df['close'], df['open'])
+    lower_shadow = np.minimum(df['close'], df['open']) - df['low']
+    avg_body = body.rolling(window=10).mean()
+    
+    # Doji: Small body
+    df['is_doji'] = (body < 0.1 * avg_body).astype(int)
+    
+    # Hammer: Small body, long lower shadow, small upper shadow
+    df['is_hammer'] = ((body < 0.3 * avg_body) & (lower_shadow > 2 * body) & (upper_shadow < body)).astype(int)
+    
+    # Engulfing (Bullish/Bearish combined magnitude)
+    prev_body = body.shift(1)
+    df['is_engulfing'] = ((body > prev_body) & (df['close'] > df['open']) & (df['open'] < df['close'].shift(1)) & (df['close'] > df['open'].shift(1))).astype(int) # Bullish Engulfing Logic simplified
+    
+    # --- Market Regime ---
+    # Volatility Regime: 0=Low, 1=High (based on ATR percentile)
+    atr_rolling_min = df['atr'].rolling(window=100).min()
+    atr_rolling_max = df['atr'].rolling(window=100).max()
+    df['regime_vol'] = (df['atr'] - atr_rolling_min) / (atr_rolling_max - atr_rolling_min + 1e-9)
+    
+    # Trend Regime: based on ADX
+    df['regime_trend'] = np.where(df['adx'] > 25, 1.0, 0.0)
+
     
     # Volume indicators
     df['obv'] = OnBalanceVolumeIndicator(close=df['close'], volume=df['volume']).on_balance_volume()
@@ -358,7 +430,11 @@ def get_feature_cols():
         'ichi_a', 'ichi_b', 'sma_cross', 'kc_width', 'dc_width',
         'bb_width', 'atr', 'volatility_std', 'obv', 'adi', 'cmf', 
         'vpt', 'eom', 'force_index', 'hour_sin', 'hour_cos', 'day_sin', 'day_cos',
-        'price_vs_bb', 'price_vs_sma50'
+        'price_vs_bb', 'price_vs_sma50',
+        # NEW FEATURES
+        'supertrend_pos', 'choppiness', 'coppock', 'ulcer',
+        'is_doji', 'is_hammer', 'is_engulfing',
+        'regime_vol', 'regime_trend'
     ]
 
 def generate_labels(df, future_periods=5, threshold=0.005):

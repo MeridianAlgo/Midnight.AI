@@ -1,5 +1,4 @@
 import torch
-import pytest
 import numpy as np
 import pandas as pd
 from src.model import MidnightModel, prepare_features, get_feature_cols
@@ -53,5 +52,5 @@ def test_feature_preparation():
 
 def test_db_initialization(tmp_path):
     db_file = tmp_path / "test_trading.db"
-    db = TradingMemoryDB(db_path=str(db_file))
+    TradingMemoryDB(db_path=str(db_file))
     assert db_file.exists()

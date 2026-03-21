@@ -3,6 +3,8 @@ import os
 # Add the project root to sys.path to allow running scripts directly from the root
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.model import MidnightModel, create_sequences, prepare_features, generate_labels, get_feature_cols
+from src.memory_db import TradingMemoryDB
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,14 +16,14 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import os
 import time
 from datetime import datetime, timedelta
-import json
 import warnings
 import signal
+import random
 import sys
+import argparse
 
 # Suppress library warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -55,11 +57,8 @@ class SharpeLoss(nn.Module):
         sharpe = (mean_ret - self.rf) / std_ret
         return -torch.tanh(sharpe)
 
-from src.model import MidnightModel, create_sequences, prepare_features, generate_labels, get_feature_cols
-from src.memory_db import TradingMemoryDB
-
 class MidnightTrainer:
-    def __init__(self, symbol='BTC-USD', device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, symbol='BTC-USD', device='cuda' if torch.cuda.is_available() else 'cpu', timeframes=None, patience=25):
         self.symbol = symbol
         self.device = device
         self.memory = TradingMemoryDB()
@@ -67,13 +66,13 @@ class MidnightTrainer:
         self.scaler = StandardScaler()
         self.best_val_loss = float('inf')
         self.patience_counter = 0
-        self.patience_limit = 15 # STOP after 15 epochs of no improvement
+        self.patience_limit = patience # STOP after 'patience' epochs of no improvement
         
         # Unique ID for this specific execution (run)
         self.run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
         
         # Timeframes for single-horizon training (per user request)
-        self.timeframes = ['1h']
+        self.timeframes = timeframes if timeframes is not None else ['1h']
         
         # Try to load existing model immediately
         self.load_existing_model()
@@ -110,26 +109,44 @@ class MidnightTrainer:
                 print(f"Resume failed: {e}")
     
     def download_multi_timeframe_data(self, start_date, end_date):
-        """Download data across multiple timeframes"""
+        """Download data across multiple timeframes with Caching"""
+        os.makedirs('data', exist_ok=True)
         all_data = {}
         
         for tf in self.timeframes:
-            try:
-                print(f"Downloading {self.symbol} {tf} data from {start_date} to {end_date}...")
-                df = yf.download(self.symbol, start=start_date, end=end_date, interval=tf, progress=False, auto_adjust=True)
-                
-                if df.empty or len(df) < 100:
-                    print(f"Insufficient data for {tf}")
-                    continue
+            # Cache filename structure
+            safe_start = start_date.split(' ')[0]
+            safe_end = end_date.split(' ')[0]
+            cache_file = f"data/{self.symbol}_{tf}_{safe_start}_{safe_end}.csv"
+            
+            if os.path.exists(cache_file):
+                print(f"Loading cached {tf} data ({safe_start} to {safe_end})...")
+                df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+                # Ensure index is datetime
+                if not isinstance(df.index, pd.DatetimeIndex):
+                    df.index = pd.to_datetime(df.index)
+            else:
+                try:
+                    print(f"Downloading {self.symbol} {tf} data from {start_date} to {end_date}...")
+                    df = yf.download(self.symbol, start=start_date, end=end_date, interval=tf, progress=False, auto_adjust=True)
                     
-                # Fix for multi-index if it still happens
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                
-                df.columns = [str(c).lower() for c in df.columns]
-                all_data[tf] = df
-            except Exception as e:
-                print(f"❌ Error downloading {tf}: {e}")
+                    if df.empty or len(df) < 100:
+                        print(f"Insufficient data for {tf}")
+                        continue
+                        
+                    # Fix for multi-index if it still happens
+                    if isinstance(df.columns, pd.MultiIndex):
+                        df.columns = df.columns.get_level_values(0)
+                    
+                    df.columns = [str(c).lower() for c in df.columns]
+                    
+                    # Save to cache
+                    df.to_csv(cache_file)
+                except Exception as e:
+                    print(f"❌ Error downloading {tf}: {e}")
+                    continue
+            
+            all_data[tf] = df
         
         return all_data
     
@@ -184,7 +201,8 @@ class MidnightTrainer:
             l_sharpe = criterion_sharpe(pred_return)
             
             # Balanced Loss: Focal (Priority) + MSE(Returns) + MSE(Vol) + Scaled Sharpe
-            loss = 2.0 * l_focal + 5.0 * l_ret + 1.0 * l_vol + 0.0001 * l_sharpe
+            # GROK ADVICE: Scale up auxiliary losses 10-100x
+            loss = 1.0 * l_focal + 50.0 * l_ret + 10.0 * l_vol + 0.1 * l_sharpe
             loss.backward()
             
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
@@ -223,7 +241,7 @@ class MidnightTrainer:
                 l_vol = criterion_reg(pred_vol, y_vol)
                 l_sharpe = criterion_sharpe(pred_return)
                 
-                loss = 2.0 * l_focal + 5.0 * l_ret + 1.0 * l_vol + 0.0001 * l_sharpe
+                loss = 1.0 * l_focal + 50.0 * l_ret + 10.0 * l_vol + 0.1 * l_sharpe
                 
                 metrics['loss'] += loss.item()
                 metrics['loss_focal'] += l_focal.item()
@@ -264,10 +282,35 @@ class MidnightTrainer:
         print("=" * 60)
         self.log_to_file(f"--- SESSION {session_num} START (DB ID: {session_id}) ---")
         
-        # Use a very safe 365 day window for high-fidelity intraday data
-        start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-        val_split_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-        end_date = datetime.now().strftime('%Y-%m-%d')
+        # RANDOM "TIME TRAVEL" WINDOW SELECTION
+        # Choose a random 6-month window WITHIN THE LAST 720 DAYS (Yahoo Limit for hourly data)
+        # This forces the model to learn universal patterns, not just recent memorization
+        
+        days_range = 720 # Max days back for hourly data on Yahoo
+        
+        # FIX: Ensure start_date is always within the days_range limit (720 days)
+        # We need: (random_days_back + window_size) < days_range
+        window_size_days = 270 # 9 months window (gives enough data but allows more "time travel" flexibility)
+        
+        max_days_back_start = days_range - window_size_days - 5 # Buffer
+        if max_days_back_start < 30:
+            max_days_back_start = 30
+            
+        random_days_back = random.randint(30, max_days_back_start)
+        
+        end_date_dt = datetime.now() - timedelta(days=random_days_back)
+        start_date_dt = end_date_dt - timedelta(days=window_size_days)
+        
+        # Split last 20% of that window for validation
+        total_duration = end_date_dt - start_date_dt
+        val_split_dt = start_date_dt + (total_duration * 0.8)
+        
+        start_date = start_date_dt.strftime('%Y-%m-%d')
+        val_split_date = val_split_dt.strftime('%Y-%m-%d')
+        end_date = end_date_dt.strftime('%Y-%m-%d')
+        
+        print(f"TIME TRAVEL: Training on historical window [{start_date} to {end_date}]")
+        self.log_to_file(f"TIME TRAVEL: Window {start_date} -> {end_date}")
         
         # Download data for all timeframes
         train_data = self.download_multi_timeframe_data(start_date, val_split_date)
@@ -297,7 +340,8 @@ class MidnightTrainer:
                     print(f"   Val samples: {len(X_val)}")
         
         if not all_X_train:
-            print("TOTAL DATA FAILURE. No training data prepared."); return
+            print("TOTAL DATA FAILURE. No training data prepared.")
+            return
         
         # Concatenate all timeframes
         X_train = np.concatenate(all_X_train, axis=0)
@@ -342,7 +386,8 @@ class MidnightTrainer:
         criterion_cls = FocalLoss()
         criterion_reg = nn.MSELoss()
         criterion_sharpe = SharpeLoss()
-        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-4) # Regularization as requested
+        # GROK ADVICE: Increased weight decay 1e-4 -> 1e-3 -> 5e-3
+        optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=5e-3)
         
         # Adaptive Learning Rate Decay (Pre-SWA stability)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
@@ -362,13 +407,12 @@ class MidnightTrainer:
         
         signal.signal(signal.SIGINT, signal_handler)
 
-        print(f"\nTraining session {session_num} (God-Tier Target: {epochs} Epochs)")
+        print(f"\nTraining session {session_num} (Target: {epochs} Epochs)")
         print("=" * 60)
         
         session_pbar = tqdm(range(epochs), desc=f"Session {session_num}", unit="epoch", leave=True)
         for epoch in session_pbar:
             start_time = time.time()
-            epoch_reached = epoch
             
             t_metrics = self.train_epoch(self.model, train_loader, criterion_cls, criterion_reg, criterion_sharpe, optimizer)
             v_metrics = self.validate(self.model, val_loader, criterion_cls, criterion_reg, criterion_sharpe)
@@ -408,6 +452,20 @@ class MidnightTrainer:
             self.log_to_file(msg)
             
             # Early stopping check
+            
+            # --- SMART STOPPING MONITOR ---
+            # Check for Generalization Gap (Overfitting / Memorization)
+            gen_gap = val_loss - train_loss
+            if gen_gap > 0.4: # Relaxed threshold meant for larger windows
+                self.log_to_file(f"WARNING: Generalization Gap > 0.4 ({gen_gap:.4f}). Memorization detected.")
+                # If gap is huge, punish patience harder
+                self.patience_counter += 1
+            
+            # Check if Val Loss is increasing while Train Loss is decreasing (Classic Overfitting) - RELAXED
+            if epoch > 10 and val_loss > self.best_val_loss * 1.2 and train_loss < self.best_val_loss:
+                 self.log_to_file("CRITICAL: Classic Overfitting Detected (Val rising, Train falling). FORCE STOP.")
+                 self.patience_counter = self.patience_limit + 1 # Force stop
+
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
@@ -422,15 +480,16 @@ class MidnightTrainer:
                 self.log_to_file(f"NEW BEST VAL LOSS: {val_loss:.4f} (Saving...)")
             else:
                 self.patience_counter += 1
+                
                 if self.patience_counter >= self.patience_limit:
-                    msg = f"EARLY STOPPING at epoch {epoch}. Validation loss hasn't improved in {self.patience_limit} epochs."
+                    msg = f"SMART STOPPING at epoch {epoch}. Model validation failed to improve or showed signs of memorization."
                     print(msg)
                     self.log_to_file(msg)
                     
                     # RESTORE BEST WEIGHTS
                     checkpoint = torch.load('models/best_model.pt', map_location=self.device, weights_only=False)
                     self.model.load_state_dict(checkpoint['model_state_dict'])
-                    print("Best weights restored. Ending current evolution cycle.")
+                    print("Best weights restored. Ending current evolution cycle to prevent overfitting.")
                     break
         
         session_pbar.close() # Ensure bar is finalized without duplication
@@ -454,12 +513,23 @@ class MidnightTrainer:
         return self.model
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Midnight.AI Training Module")
+    parser.add_argument("--symbol", type=str, default="BTC-USD", help="Crypto symbol to train on (e.g., BTC-USD, ETH-USD)")
+    parser.add_argument("--timeframes", type=str, nargs="+", default=["1h"], help="Timeframes to train on (e.g., 1h 4h 1d)")
+    parser.add_argument("--sessions", type=int, default=20, help="Number of training sessions (evolutions)")
+    parser.add_argument("--epochs", type=int, default=100, help="Epochs per session")
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
+    parser.add_argument("--lr", type=float, default=0.0005, help="Learning rate")
+    parser.add_argument("--patience", type=int, default=25, help="Early stopping patience")
+    args = parser.parse_args()
+
     # Create models directory
     os.makedirs('models', exist_ok=True)
     
-    trainer = MidnightTrainer(symbol='BTC-USD')
-    # Trigger 20 sessions for real training as requested
-    for i in range(20):
-        trainer.train(epochs=100, batch_size=64, learning_rate=0.001, session_num=i+1)
-        print("Cooling down for 10 seconds before next evolution...")
-        time.sleep(10)
+    trainer = MidnightTrainer(symbol=args.symbol, timeframes=args.timeframes, patience=args.patience)
+    # Trigger sessions for real training
+    for i in range(args.sessions):
+        trainer.train(epochs=args.epochs, batch_size=args.batch_size, learning_rate=args.lr, session_num=i+1)
+        if i < args.sessions - 1:
+            print("Cooling down for 10 seconds before next evolution...")
+            time.sleep(10)
